@@ -13,7 +13,7 @@ import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # === ⚙️ НАСТРОЙКИ ===
-TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"       # токен от @BotFather
+TOKEN = "7813840039:AAFquVUm1z_IXM60VJwWqftocUCFYGhHRYI"       # токен от @BotFather
 TIMEZONE = "Europe/Kyiv"                # Киев
 # (необязательно) зафиксировать чат/ветку:
 ALLOWED_CHAT_ID = None                  # например: -1001234567890 (чтобы бот отвечал только в этой группе)
