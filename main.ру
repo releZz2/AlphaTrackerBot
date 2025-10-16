@@ -1,0 +1,250 @@
+# AlphaTrackerBot v1.0 — Chat Edition
+# Функции:
+#  - /drop Имя 240AP вернут 3,5 последний 5-7 — сохранить данные участника
+#  - /newdrop [сегодня|завтра] HH:MM порог 200 — создать дроп, сразу дать топ-3 и поставить напоминания на −4/−3/−2/−1 ч
+#  - /stats — сводка по последним апдейтам
+#  - /id — показать chat_id; /thread — показать thread_id (для ветки)
+#  - автопинг каждые 14 минут, чтобы не «засыпал» на Render
+#  - поддержка работы в конкретном чате и конкретной ветке (необязательно)
+
+import os, sqlite3, datetime, threading, time
+import pytz
+import telebot
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# === ⚙️ НАСТРОЙКИ ===
+TOKEN = "ВСТАВЬ_СВОЙ_ТОКЕН_СЮДА"       # токен от @BotFather
+TIMEZONE = "Europe/Kyiv"                # Киев
+# (необязательно) зафиксировать чат/ветку:
+ALLOWED_CHAT_ID = None                  # например: -1001234567890 (чтобы бот отвечал только в этой группе)
+DEFAULT_CHAT_ID = None                  # чат, куда слать автопинг/напоминания (если хочешь фиксировать)
+DEFAULT_THREAD_ID = None                # id ветки (message_thread_id) для сообщений бота (если нужна ветка)
+
+# участники (для справки/валидации, можно оставить пустым — бот не ограничивает имена)
+KNOWN_PARTICIPANTS = ["Назар","releZz","Ангелина 19","Ваня","Андрей","Ярик","Серёга"]
+
+# === 🧩 ИНИЦИАЛИЗАЦИЯ ===
+tz = pytz.timezone(TIMEZONE)
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+
+# БД
+conn = sqlite3.connect("drops.db", check_same_thread=False)
+cur = conn.cursor()
+cur.execute("""CREATE TABLE IF NOT EXISTS users(
+    name TEXT PRIMARY KEY,
+    ap   INTEGER,
+    expire TEXT,      -- "3,5"
+    last   TEXT,      -- "5-7"
+    updated TIMESTAMP
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    when_ts TEXT,     -- ISO-формат времени дропа
+    ap_req INTEGER
+)""")
+conn.commit()
+
+scheduler = BackgroundScheduler(timezone=tz)
+scheduler.start()
+
+# === 🔧 УТИЛИТЫ ===
+def now_kiev():
+    return datetime.datetime.now(tz)
+
+def parse_expire(s: str):
+    return [int(x) for x in s.replace(',', ' ').split() if x.isdigit()]
+
+def parse_last(s: str):
+    return [int(x) for x in s.replace('-', ' ').split() if x.isdigit()]
+
+def calc_priority(ap: int, expire_list, last_list, drop_ap: int) -> int:
+    soon = any(d <= 3 for d in expire_list) if expire_list else False
+    rest = (max(last_list) >= 7) if last_list else False
+    surplus = (ap >= drop_ap + 20)
+    # веса: +2 за скорый возврат, +1 за запас AP, +1 за «давно не брал»
+    return (2 if soon else 0) + (1 if surplus else 0) + (1 if rest else 0)
+
+def send_msg(chat_id, text, thread_id=None):
+    kwargs = {}
+    if thread_id is not None:
+        kwargs["message_thread_id"] = thread_id
+    bot.send_message(chat_id, text, **kwargs)
+
+def is_allowed_chat(message):
+    return (ALLOWED_CHAT_ID is None) or (message.chat.id == ALLOWED_CHAT_ID)
+
+# === ⏰ АВТОПИНГ (14 мин) — держим инстанс активным
+def ping_job():
+    if DEFAULT_CHAT_ID is None:
+        return
+    stamp = now_kiev().strftime("%H:%M")
+    try:
+        send_msg(DEFAULT_CHAT_ID, f"✅ Ping — бот активен ({stamp})", DEFAULT_THREAD_ID)
+    except Exception as e:
+        print("Ping error:", e)
+
+scheduler.add_job(ping_job, "interval", minutes=14)
+
+# === 📊 ВЫБОР ТОП-3
+def select_top3(ap_req: int):
+    cur.execute("SELECT name, ap, expire, last, updated FROM users")
+    rows = cur.fetchall()
+    scored = []
+    for name, ap, expire, last, _ in rows:
+        ap_val = int(ap or 0)
+        exp_list = parse_expire(expire or "")
+        last_list = parse_last(last or "")
+        score = calc_priority(ap_val, exp_list, last_list, ap_req)
+        scored.append((name, ap_val, exp_list, last_list, score))
+    scored.sort(key=lambda x: x[4], reverse=True)
+    return scored[:3], scored
+
+def announce_selection(chat_id, when_dt, ap_req, thread_id=None):
+    top3, all_scored = select_top3(ap_req)
+    top_line = ", ".join([t[0] for t in top3]) if top3 else "нет данных"
+    lines = ["📋 Приоритет:"]
+    for name, ap, exp_li, last_li, score in all_scored[:7]:
+        lines.append(f"• {name}: score <b>{score}</b> | {ap}AP | вернут {exp_li or '-'} | последний {last_li or '-'}")
+    text = (
+        f"💧 Дроп {when_dt.strftime('%d.%m %H:%M')} | Порог {ap_req} AP\n"
+        f"✅ Лучше всего подходят: <b>{top_line}</b>\n\n" + "\n".join(lines)
+    )
+    send_msg(chat_id, text, thread_id)
+
+def remind_job(chat_id, when_dt, ap_req, hours_left, thread_id=None):
+    top3, _ = select_top3(ap_req)
+    top_line = ", ".join([t[0] for t in top3]) if top3 else "нет данных"
+    send_msg(chat_id, f"⏰ Через {hours_left}ч дроп ({when_dt.strftime('%H:%M')}) | Забирают: <b>{top_line}</b>", thread_id)
+
+# === 🧠 КОМАНДЫ ===
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    if not is_allowed_chat(message): return
+    bot.reply_to(message,
+        "Привет 👋 Я AlphaTrackerBot.\n"
+        "Команды:\n"
+        "• /drop Имя 240AP вернут 3,5 последний 5-7\n"
+        "• /newdrop [сегодня|завтра] HH:MM порог 200\n"
+        "• /stats — сводка\n"
+        "• /id — chat_id, /thread — thread_id"
+    )
+
+@bot.message_handler(commands=["id"])
+def cmd_id(message):
+    if not is_allowed_chat(message): return
+    bot.reply_to(message, f"🔎 chat_id: <code>{message.chat.id}</code>")
+
+@bot.message_handler(commands=["thread"])
+def cmd_thread(message):
+    if not is_allowed_chat(message): return
+    bot.reply_to(message, f"🧵 thread_id: <code>{getattr(message, 'message_thread_id', None)}</code>")
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(message):
+    if not is_allowed_chat(message): return
+    cur.execute("SELECT name, ap, expire, last, updated FROM users ORDER BY name")
+    rows = cur.fetchall()
+    if not rows:
+        bot.reply_to(message, "Пока нет данных. Используйте /drop чтобы заполнить.")
+        return
+    lines = ["📊 Сводка участников:"]
+    for name, ap, exp, last, updated in rows:
+        lines.append(f"• {name}: {ap}AP | вернут {exp or '-'} | последний {last or '-'} | upd {updated[:16]}")
+    bot.reply_to(message, "\n".join(lines))
+
+@bot.message_handler(commands=["drop"])
+def cmd_drop(message):
+    if not is_allowed_chat(message): return
+    # пример: /drop Серёга 240AP вернут 3,5 последний 5-7
+    try:
+        parts = message.text.strip().split()
+        if len(parts) < 6:
+            raise ValueError("too short")
+        name = parts[1]
+        ap_str = parts[2]
+        ap_val = int("".join([c for c in ap_str if c.isdigit()]))
+
+        text_low = message.text.lower()
+        if "вернут" not in text_low or "последний" not in text_low:
+            raise ValueError("no keywords")
+
+        after_return = text_low.split("вернут", 1)[1].strip()
+        ret_part = after_return.split("последний", 1)[0].strip()
+        last_part = text_low.split("последний", 1)[1].strip()
+
+        expire_list = parse_expire(ret_part)
+        last_list = parse_last(last_part)
+
+        cur.execute("REPLACE INTO users(name, ap, expire, last, updated) VALUES (?,?,?,?,?)",
+                    (name, ap_val, ",".join(map(str,expire_list)), "-".join(map(str,last_list)), now_kiev().isoformat()))
+        conn.commit()
+        bot.reply_to(message, f"✅ Обновлено: <b>{name}</b> — {ap_val}AP | вернут {expire_list or '-'} | последний {last_list or '-'}")
+
+    except Exception:
+        bot.reply_to(message, "❌ Пример:\n/drop Серёга 240AP вернут 3,5 последний 5-7")
+
+@bot.message_handler(commands=["newdrop"])
+def cmd_newdrop(message):
+    if not is_allowed_chat(message): return
+    # пример: /newdrop завтра 14:00 порог 200  или  /newdrop 16:30 порог 210
+    try:
+        text = message.text.lower().replace("/newdrop", "").strip()
+        if "порог" not in text:
+            raise ValueError("no ap req")
+        time_part = text.split("порог", 1)[0].strip()
+        ap_req = int("".join([c for c in text.split("порог",1)[1] if c.isdigit()]))
+
+        base = now_kiev()
+        if "завтра" in time_part:
+            base = base + datetime.timedelta(days=1)
+            time_part = time_part.replace("завтра", "").strip()
+        if "сегодня" in time_part:
+            time_part = time_part.replace("сегодня", "").strip()
+
+        hm = [int(x) for x in time_part.replace(":", " ").split() if x.isdigit()]
+        if len(hm) != 2: raise ValueError("bad time")
+        h, m = hm
+        event_dt = tz.localize(datetime.datetime(base.year, base.month, base.day, h, m))
+
+        # сохраняем событие
+        cur.execute("INSERT INTO events(when_ts, ap_req) VALUES(?,?)", (event_dt.isoformat(), ap_req))
+        conn.commit()
+
+        thread_id = getattr(message, "message_thread_id", DEFAULT_THREAD_ID)
+        # мгновенная рекомендация
+        announce_selection(message.chat.id, event_dt, ap_req, thread_id)
+
+        # напоминания −4/−3/−2/−1 ч
+        now_dt = now_kiev()
+        for hours in [4,3,2,1]:
+            run_at = event_dt - datetime.timedelta(hours=hours)
+            if run_at > now_dt:
+                scheduler.add_job(remind_job, "date",
+                                  run_date=run_at,
+                                  args=[message.chat.id, event_dt, ap_req, hours, thread_id])
+
+        bot.reply_to(message, f"✅ Дроп создан: {event_dt.strftime('%d.%m %H:%M')} | Порог {ap_req} AP")
+
+    except Exception:
+        bot.reply_to(message, "❌ Примеры:\n"
+                              "/newdrop завтра 14:00 порог 200\n"
+                              "/newdrop 16:30 порог 210")
+
+# === 🚀 ПОЛЛИНГ + РЕЗЕРВНЫЙ ПИНГ ===
+def run_polling():
+    print("Polling started…")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+
+threading.Thread(target=run_polling, daemon=True).start()
+
+def backup_ping_loop():
+    while True:
+        try: ping_job()
+        except: pass
+        time.sleep(60*14)
+
+threading.Thread(target=backup_ping_loop, daemon=True).start()
+
+# держим главный поток
+while True:
+    time.sleep(3600)
